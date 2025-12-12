@@ -1,4 +1,11 @@
-"""Screenshot utilities for capturing Android device screen."""
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Android 截屏工具（带设备号）
+支持单设备/多设备，失败自动返回黑屏并标记原因。
+"""
+
+from __future__ import annotations
 
 import base64
 import os
@@ -7,103 +14,109 @@ import tempfile
 import uuid
 from dataclasses import dataclass
 from io import BytesIO
-from typing import Tuple
+from typing import List, Optional
 
 from PIL import Image
 
 
+# ---------- 数据模型 ----------
 @dataclass
 class Screenshot:
-    """Represents a captured screenshot."""
-
     base64_data: str
     width: int
     height: int
+    device_id: str
     is_sensitive: bool = False
 
 
-def get_screenshot(device_id: str | None = None, timeout: int = 10) -> Screenshot:
+# ---------- 内部工具 ----------
+def _run(cmd: List[str], timeout: int = 10) -> str:
+    """执行命令并返回 stdout，非零退出码抛 RuntimeError。"""
+    cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if cp.returncode != 0:
+        raise RuntimeError(f"命令失败: {' '.join(cmd)}\n{cp.stderr}")
+    return cp.stdout
+
+
+def _get_single_device() -> str:
+    """返回当前唯一在线设备序列号；非唯一则抛异常。"""
+    out = _run(["adb", "devices"]).strip().splitlines()
+    devices = [ln.split("\t")[0] for ln in out if ln.endswith("\tdevice")]
+    if len(devices) != 1:
+        raise RuntimeError(f"当前连接设备数={len(devices)}，必须显式指定 device_id")
+    return devices[0]
+
+
+def _build_adb_prefix(device_id: Optional[str]) -> List[str]:
+    """构造 adb -s 前缀，并返回最终使用的 device_id。"""
+    real_id = device_id or _get_single_device()
+    return ["adb", "-s", real_id], real_id
+
+
+def _black_fallback(device_id: str, is_sensitive: bool) -> Screenshot:
+    """生成黑屏 fallback。"""
+    w, h = 1080, 2400
+    img = Image.new("RGB", (w, h), color="black")
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    return Screenshot(
+        base64_data=b64, width=w, height=h, device_id=device_id, is_sensitive=is_sensitive
+    )
+
+
+# ---------- 主入口 ----------
+def get_screenshot(device_id: Optional[str] = None, timeout: int = 10) -> Screenshot:
     """
-    Capture a screenshot from the connected Android device.
-
-    Args:
-        device_id: Optional ADB device ID for multi-device setups.
-        timeout: Timeout in seconds for screenshot operations.
-
-    Returns:
-        Screenshot object containing base64 data and dimensions.
-
-    Note:
-        If the screenshot fails (e.g., on sensitive screens like payment pages),
-        a black fallback image is returned with is_sensitive=True.
+    截屏并返回 Screenshot 对象，始终携带实际使用的 device_id。
+    失败时返回黑屏，is_sensitive=True 表示因敏感界面被系统拒绝。
     """
-    temp_path = os.path.join(tempfile.gettempdir(), f"screenshot_{uuid.uuid4()}.png")
-    adb_prefix = _get_adb_prefix(device_id)
-
     try:
-        # Execute screenshot command
-        result = subprocess.run(
-            adb_prefix + ["shell", "screencap", "-p", "/sdcard/tmp.png"],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        adb_prefix, real_id = _build_adb_prefix(device_id)
+        remote = "/sdcard/tmp_screenshot.png"
+        local = os.path.join(tempfile.gettempdir(), f"scr_{uuid.uuid4().hex}.png")
 
-        # Check for screenshot failure (sensitive screen)
-        output = result.stdout + result.stderr
-        if "Status: -1" in output or "Failed" in output:
-            return _create_fallback_screenshot(is_sensitive=True)
+        # 1. 截屏
+        out = _run(adb_prefix + ["shell", "screencap", "-p", remote], timeout=timeout)
+        if "Status: -1" in out or "Failed" in out:
+            return _black_fallback(real_id, is_sensitive=True)
 
-        # Pull screenshot to local temp path
-        subprocess.run(
-            adb_prefix + ["pull", "/sdcard/tmp.png", temp_path],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
+        # 2. pull
+        _run(adb_prefix + ["pull", remote, local], timeout=30)
 
-        if not os.path.exists(temp_path):
-            return _create_fallback_screenshot(is_sensitive=False)
+        # 3. 编码
+        with Image.open(local) as img:
+            w, h = img.size
+            buf = BytesIO()
+            img.save(buf, format="PNG")
+            b64 = base64.b64encode(buf.getvalue()).decode()
 
-        # Read and encode image
-        img = Image.open(temp_path)
-        width, height = img.size
-
-        buffered = BytesIO()
-        img.save(buffered, format="PNG")
-        base64_data = base64.b64encode(buffered.getvalue()).decode("utf-8")
-
-        # Cleanup
-        os.remove(temp_path)
+        # 4. 清理
+        os.remove(local)
+        _run(adb_prefix + ["shell", "rm", "-f", remote], timeout=5)
 
         return Screenshot(
-            base64_data=base64_data, width=width, height=height, is_sensitive=False
+            base64_data=b64,
+            width=w,
+            height=h,
+            device_id=real_id,
+            is_sensitive=False,
         )
 
-    except Exception as e:
-        print(f"Screenshot error: {e}")
-        return _create_fallback_screenshot(is_sensitive=False)
+    except Exception as exc:
+        # 任何异常都返回黑屏，device_id 仍带回
+        print(f"[Screenshot] {exc}")
+        return _black_fallback(
+            device_id=real_id if "real_id" in locals() else (device_id or "unknown"),
+            is_sensitive=False,
+        )
 
 
-def _get_adb_prefix(device_id: str | None) -> list:
-    """Get ADB command prefix with optional device specifier."""
-    if device_id:
-        return ["adb", "-s", device_id]
-    return ["adb"]
+# ---------- CLI 简单测试 ----------
+if __name__ == "__main__":
+    import json
 
-
-def _create_fallback_screenshot(is_sensitive: bool) -> Screenshot:
-    """Create a black fallback image when screenshot fails."""
-    default_width, default_height = 1080, 2400
-
-    black_img = Image.new("RGB", (default_width, default_height), color="black")
-    buffered = BytesIO()
-    black_img.save(buffered, format="PNG")
-    base64_data = base64.b64encode(buffered.getvalue()).decode("utf-8")
-
-    return Screenshot(
-        base64_data=base64_data,
-        width=default_width,
-        height=default_height,
-        is_sensitive=is_sensitive,
-    )
+    pic = get_screenshot()
+    print(json.dumps({"device_id": pic.device_id, "size": [pic.width, pic.height],
+                      "is_sensitive": pic.is_sensitive, "base64_len": len(pic.base64_data)},
+                     ensure_ascii=False, indent=2))
